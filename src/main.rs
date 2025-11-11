@@ -130,7 +130,16 @@ fn get_args() -> clap::App<'static, 'static> {
         .arg(Arg::with_name("valid_chars")
              .long("valid-chars")
              .default_value("ATGCatgc")
-             .help("Valid characters in an alternative haplotype. This prevents non sequence-resolved variants from being genotyped."));
+             .help("Valid characters in an alternative haplotype. This prevents non sequence-resolved variants from being genotyped."))
+        .arg(Arg::with_name("max_reads_per_cell")
+             .short("k")
+             .long("max-reads-per-cell")
+             .value_name("INTEGER")
+             .help("Cap reads per cell per site (no-UMI mode)"))
+        .arg(Arg::with_name("max_reads_per_umi")
+             .long("max-reads-per-umi")
+             .value_name("INTEGER")
+             .help("Cap reads per (cell,UMI) per site (UMI mode)"));
     args
 }
 
@@ -194,6 +203,14 @@ fn _main(cli_args: Vec<String>) -> Result<(), Error> {
     let ll = args.value_of("log_level").unwrap();
     let bam_tag = args.value_of("bam_tag").unwrap_or_default();
     let valid_chars = args.value_of("valid_chars").unwrap_or_default();
+    let max_reads_per_cell = args.value_of("max_reads_per_cell").map(|s| {
+        s.parse::<usize>()
+            .expect("max-reads-per-cell must be integer")
+    });
+    let max_reads_per_umi = args.value_of("max_reads_per_umi").map(|s| {
+        s.parse::<usize>()
+            .expect("max-reads-per-umi must be integer")
+    });
 
     let ll = match ll {
         "info" => LevelFilter::Info,
@@ -274,6 +291,8 @@ fn _main(cli_args: Vec<String>) -> Result<(), Error> {
             .iter()
             .cloned()
             .collect(),
+        max_reads_per_cell,
+        max_reads_per_umi,
     };
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -303,6 +322,7 @@ fn _main(cli_args: Vec<String>) -> Result<(), Error> {
         num_non_umi: 0,
         num_invalid_recs: 0,
         num_multiallelic_recs: 0,
+        num_capped: 0,
     };
 
     fn add_metrics(metrics: &mut Metrics, m: &Metrics) {
@@ -315,6 +335,7 @@ fn _main(cli_args: Vec<String>) -> Result<(), Error> {
         metrics.num_non_umi += m.num_non_umi;
         metrics.num_invalid_recs += m.num_invalid_recs;
         metrics.num_multiallelic_recs += m.num_multiallelic_recs;
+        metrics.num_capped += m.num_capped;
     }
 
     for v in results {
@@ -377,6 +398,10 @@ fn _main(cli_args: Vec<String>) -> Result<(), Error> {
         "Number of VCF records skipped due to being multi-allelic: {}",
         metrics.num_multiallelic_recs
     );
+    info!(
+        "Number of alignments skipped due to read cap: {}",
+        metrics.num_capped
+    );
 
     let _ = write_matrix_market(&out_matrix_path as &str, &matrix)
         .context("Error writing out-matrix")?;
@@ -424,6 +449,8 @@ pub struct Arguments {
     use_umi: bool,
     bam_tag: String,
     valid_chars: HashSet<u8>,
+    max_reads_per_cell: Option<usize>,
+    max_reads_per_umi: Option<usize>,
 }
 
 pub struct RecHolder<'a> {
@@ -456,6 +483,7 @@ pub struct Metrics {
     pub num_non_umi: usize,
     pub num_invalid_recs: usize,
     pub num_multiallelic_recs: usize,
+    pub num_capped: usize,
 }
 
 pub struct ReaderWrapper {
@@ -635,6 +663,7 @@ pub fn evaluate_rec<'a>(
         num_non_umi: 0,
         num_invalid_recs: 0,
         num_multiallelic_recs: 0,
+        num_capped: 0,
     };
 
     let mut r = EvaluateAlnResults {
@@ -826,6 +855,11 @@ pub fn evaluate_alns(
     ))?;
 
     debug!("Evaluating record {}", locus_str);
+
+    // Initialize counters for read capping
+    let mut per_cell_counts: HashMap<u32, usize> = HashMap::new();
+    let mut per_cell_umi_counts: HashMap<(u32, Vec<u8>), usize> = HashMap::new();
+
     for _rec in bam.records() {
         let rec = _rec?;
         r.metrics.num_reads += 1;
@@ -892,6 +926,28 @@ pub fn evaluate_alns(
         } else {
             _umi.unwrap()
         };
+
+        // Enforce caps before expensive alignment
+        if args.use_umi {
+            if let Some(cap) = args.max_reads_per_umi {
+                let key = (cell_index, umi.clone());
+                let count = per_cell_umi_counts.entry(key).or_insert(0);
+                if *count >= cap {
+                    r.metrics.num_capped += 1;
+                    continue; // skip heavy alignment
+                }
+                *count += 1;
+            }
+        } else {
+            if let Some(cap) = args.max_reads_per_cell {
+                let count = per_cell_counts.entry(cell_index).or_insert(0);
+                if *count >= cap {
+                    r.metrics.num_capped += 1;
+                    continue; // skip heavy alignment
+                }
+                *count += 1;
+            }
+        }
 
         let seq = &rec.seq().as_bytes();
 
