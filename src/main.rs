@@ -1,7 +1,7 @@
 use failure::format_err;
 use human_panic::setup_panic;
 use log::{debug, error, info, warn};
-
+use rand::Rng;
 use bio::alignment::pairwise::banded;
 use bio::io::fasta;
 use clap::{App, Arg};
@@ -843,10 +843,6 @@ pub fn evaluate_alns(
     r: &mut EvaluateAlnResults,
     locus_str: &String,
 ) -> Result<(), Error> {
-    // loop over all alignments in the region of interest
-    // if the alignments are useful (aligned over this region)
-    // perform Smith-Waterman against both haplotypes
-    // and report the scores
 
     bam.fetch((
         haps.locus.chrom.as_bytes(),
@@ -856,9 +852,37 @@ pub fn evaluate_alns(
 
     debug!("Evaluating record {}", locus_str);
 
-    // Initialize counters for read capping
-    let mut per_cell_counts: HashMap<u32, usize> = HashMap::new();
-    let mut per_cell_umi_counts: HashMap<(u32, Vec<u8>), usize> = HashMap::new();
+    let mut rng = rand::thread_rng();
+
+    // ---------------------------------------------------------
+    // Reservoir bookkeeping
+    //
+    // Non-UMI:
+    //   cell -> number of eligible reads encountered
+    //   cell -> reservoir of up to max_reads_per_cell reads
+    //
+    // UMI:
+    //   (cell, UMI) -> number encountered
+    //   (cell, UMI) -> reservoir of up to max_reads_per_umi reads
+    // ---------------------------------------------------------
+
+    let mut per_cell_seen: HashMap<u32, usize> = HashMap::new();
+    let mut per_cell_reservoir:
+        HashMap<u32, Vec<(Record, u32, Vec<u8>)>> = HashMap::new();
+
+    let mut per_cell_umi_seen:
+        HashMap<(u32, Vec<u8>), usize> = HashMap::new();
+    let mut per_cell_umi_reservoir:
+        HashMap<(u32, Vec<u8>), Vec<(Record, u32, Vec<u8>)>> =
+            HashMap::new();
+
+    // Reads that are not subject to a cap can still be processed
+    // after BAM traversal using this vector.
+    let mut uncapped_reads: Vec<(Record, u32, Vec<u8>)> = Vec::new();
+
+    // ---------------------------------------------------------
+    // Traverse ALL reads overlapping this variant
+    // ---------------------------------------------------------
 
     for _rec in bam.records() {
         let rec = _rec?;
@@ -872,7 +896,8 @@ pub fn evaluate_alns(
             );
             r.metrics.num_low_mapq += 1;
             continue;
-        } else if args.primary & (rec.is_secondary() | rec.is_supplementary()) {
+
+        } else if args.primary && (rec.is_secondary() || rec.is_supplementary()) {
             debug!(
                 "{} skipping read {} due to not being the primary alignment",
                 locus_str,
@@ -880,7 +905,8 @@ pub fn evaluate_alns(
             );
             r.metrics.num_non_primary += 1;
             continue;
-        } else if args.duplicates & rec.is_duplicate() {
+
+        } else if args.duplicates && rec.is_duplicate() {
             debug!(
                 "{} skipping read {} due to being a duplicate",
                 locus_str,
@@ -888,7 +914,8 @@ pub fn evaluate_alns(
             );
             r.metrics.num_duplicates += 1;
             continue;
-        } else if useful_alignment(haps, &rec)? == false {
+
+        } else if !useful_alignment(haps, &rec)? {
             debug!(
                 "{} skipping read {} due to not being useful",
                 locus_str,
@@ -898,7 +925,9 @@ pub fn evaluate_alns(
             continue;
         }
 
-        let cell_index = get_cell_barcode(&rec, cell_barcodes, &args.bam_tag);
+        let cell_index =
+            get_cell_barcode(&rec, cell_barcodes, &args.bam_tag);
+
         if cell_index.is_none() {
             debug!(
                 "{} skipping read {} due to not having a cell barcode",
@@ -908,10 +937,12 @@ pub fn evaluate_alns(
             r.metrics.num_not_cell_bc += 1;
             continue;
         }
+
         let cell_index = cell_index.unwrap();
 
         let _umi = get_umi(&rec);
-        if (args.use_umi == true) & _umi.is_none() {
+
+        if args.use_umi && _umi.is_none() {
             debug!(
                 "{} skipping read {} due to not having a UMI",
                 locus_str,
@@ -920,54 +951,155 @@ pub fn evaluate_alns(
             r.metrics.num_non_umi += 1;
             continue;
         }
-        // if no UMIs in this dataset, just plug in dummy UMI
-        let umi = if args.use_umi == false {
-            vec![1 as u8]
-        } else {
+
+        let umi = if args.use_umi {
             _umi.unwrap()
+        } else {
+            vec![1u8]
         };
 
-        // Enforce caps before expensive alignment
+        // =====================================================
+        // UMI MODE
+        // =====================================================
+
         if args.use_umi {
+
             if let Some(cap) = args.max_reads_per_umi {
+
                 let key = (cell_index, umi.clone());
-                let count = per_cell_umi_counts.entry(key).or_insert(0);
-                if *count >= cap {
+
+                let seen = per_cell_umi_seen
+                    .entry(key.clone())
+                    .or_insert(0);
+
+                *seen += 1;
+
+                let reservoir = per_cell_umi_reservoir
+                    .entry(key)
+                    .or_insert_with(Vec::new);
+
+                if reservoir.len() < cap {
+
+                    // Fill initial reservoir.
+                    reservoir.push((rec, cell_index, umi));
+
+                } else {
+
+                    // We have now seen `seen` eligible reads.
+                    //
+                    // Draw uniformly from [0, seen).
+                    // If j < cap, replace that reservoir entry.
+                    let j = rng.gen_range(0..*seen);
+
+                    if j < cap {
+                        reservoir[j] = (rec, cell_index, umi);
+                    }
+
+                    // "Capped" here means the read arrived after
+                    // the reservoir had already reached capacity.
                     r.metrics.num_capped += 1;
-                    continue; // skip heavy alignment
                 }
-                *count += 1;
+
+            } else {
+                // UMI mode, but no cap
+                uncapped_reads.push((rec, cell_index, umi));
             }
+
+        // =====================================================
+        // NON-UMI MODE
+        // =====================================================
+
         } else {
+
             if let Some(cap) = args.max_reads_per_cell {
-                let count = per_cell_counts.entry(cell_index).or_insert(0);
-                if *count >= cap {
+
+                let seen = per_cell_seen
+                    .entry(cell_index)
+                    .or_insert(0);
+
+                *seen += 1;
+
+                let reservoir = per_cell_reservoir
+                    .entry(cell_index)
+                    .or_insert_with(Vec::new);
+
+                if reservoir.len() < cap {
+
+                    reservoir.push((rec, cell_index, umi));
+
+                } else {
+
+                    let j = rng.gen_range(0..*seen);
+
+                    if j < cap {
+                        reservoir[j] = (rec, cell_index, umi);
+                    }
+
                     r.metrics.num_capped += 1;
-                    continue; // skip heavy alignment
                 }
-                *count += 1;
+
+            } else {
+                // no-UMI mode, no cap
+                uncapped_reads.push((rec, cell_index, umi));
             }
         }
+    }
 
-        let seq = &rec.seq().as_bytes();
+    // ---------------------------------------------------------
+    // Assemble reads that actually survived sampling
+    // ---------------------------------------------------------
 
-        let score = |a: u8, b: u8| if a == b { MATCH } else { MISMATCH };
-        let mut aligner = banded::Aligner::new(GAP_OPEN, GAP_EXTEND, score, K, W);
-        let ref_alignment = aligner.local(seq, &haps.rref);
-        let alt_alignment = aligner.local(seq, &haps.alt);
+    let mut reads_to_align: Vec<(Record, u32, Vec<u8>)> =
+        uncapped_reads;
+
+    if args.use_umi {
+        for (_key, mut reads) in per_cell_umi_reservoir {
+            reads_to_align.append(&mut reads);
+        }
+    } else {
+        for (_cell, mut reads) in per_cell_reservoir {
+            reads_to_align.append(&mut reads);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Expensive REF/ALT Smith-Waterman alignment
+    // performed ONLY on sampled reads
+    // ---------------------------------------------------------
+
+    for (rec, cell_index, umi) in reads_to_align {
+
+        let seq = rec.seq().as_bytes();
+
+        let score =
+            |a: u8, b: u8| if a == b { MATCH } else { MISMATCH };
+
+        let mut aligner =
+            banded::Aligner::new(
+                GAP_OPEN,
+                GAP_EXTEND,
+                score,
+                K,
+                W,
+            );
+
+        let ref_alignment = aligner.local(&seq, &haps.rref);
+        let alt_alignment = aligner.local(&seq, &haps.alt);
 
         debug!(
             "{} {} ref_aln:\n{}",
             locus_str,
             String::from_utf8(rec.qname().to_vec()).unwrap(),
-            ref_alignment.pretty(seq, &haps.rref)
+            ref_alignment.pretty(&seq, &haps.rref)
         );
+
         debug!(
             "{} {} alt_aln:\n{}",
             locus_str,
             String::from_utf8(rec.qname().to_vec()).unwrap(),
-            alt_alignment.pretty(seq, &haps.alt)
+            alt_alignment.pretty(&seq, &haps.alt)
         );
+
         debug!(
             "{} {} ref_score: {} alt_score: {}",
             locus_str,
@@ -977,15 +1109,17 @@ pub fn evaluate_alns(
         );
 
         let s = Scores {
-            cell_index: cell_index,
-            umi: umi,
+            cell_index,
+            umi,
             ref_score: ref_alignment.score,
             alt_score: alt_alignment.score,
         };
 
         r.scores.push(s);
     }
+
     r.scores.sort_by_key(|s| s.cell_index);
+
     Ok(())
 }
 
